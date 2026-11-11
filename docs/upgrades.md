@@ -73,3 +73,47 @@ scripts/bump-version
 
 Once the tag from `scripts/bump-version` has been created and pushed to the repository, the pypi
 github action will automatically start and publish the package to pypi.
+
+## Explaining Result Changes When Regenerating Baselines
+
+When a baseline is regenerated (e.g. after a version upgrade, a plugin
+configuration change, or new exclusion patterns), findings may disappear even
+though the underlying source code never changed. **"Not scanned this time" is
+not the same as "problem resolved".** Before accepting a baseline update that
+drops findings, produce a policy change explanation:
+
+```bash
+scripts/compare_baselines.py .secrets.baseline.old .secrets.baseline
+```
+
+This compares the two baselines' **plugins** (enabled/disabled, limit and
+other configuration changes), **file and line exclusions**, and **filters**,
+and attributes each disappeared finding to one of the following:
+
+- `plugin_disabled` / `file_excluded`: verifiable from baseline metadata
+  alone. The content was *not* re-evaluated -- the new policy simply no longer
+  looks for it. Confirm the policy change was intentional.
+- `plugin_config_changed` / `filter_changed`: candidate explanations that
+  cannot be confirmed without the source content (entropy cannot be
+  recomputed from a hashed secret). Flagged as **NEEDS RESCAN**.
+- `undetermined`: no policy change explains the disappearance. Flagged as
+  **NEEDS RESCAN** -- the source may have changed, or the finding may have
+  been silently lost.
+
+The report ends with a rescan recommendation: the exact files to re-scan and
+a ready-to-run command using the *old* baseline's policy. Findings previously
+audited as `is_secret=true` are called out separately, since those always
+require a re-audit decision. The script exits non-zero whenever a rescan is
+recommended, so it can gate the baseline update in automation.
+
+Notes:
+
+- Both baselines are normalized through the standard upgrade path
+  (`detect_secrets.core.baseline.upgrade`), so older baseline formats are
+  accepted as-is -- no manual reformatting needed.
+- The report only contains metadata already present in baselines (filenames,
+  line numbers, secret types, audit labels, hashed secrets). Raw secrets
+  never appear in it.
+- A checked-in migration sample (`test_data/policy_diff/`) demonstrates the
+  workflow: a `0.11.0` baseline compared against a regenerated `1.5.0`
+  baseline. See `tests/core/policy_diff_test.py` for the expected report.

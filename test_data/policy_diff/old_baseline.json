@@ -1,0 +1,75 @@
+{
+  "version": "0.11.0",
+  "plugins_used": [
+    {
+      "name": "Base64HighEntropyString",
+      "base64_limit": 4.5
+    },
+    {
+      "name": "HexHighEntropyString",
+      "hex_limit": 3
+    },
+    {
+      "name": "KeywordDetector"
+    },
+    {
+      "name": "PrivateKeyDetector"
+    },
+    {
+      "name": "SlackDetector"
+    }
+  ],
+  "exclude_regex": "^dist/",
+  "results": {
+    "config/settings.py": [
+      {
+        "type": "Slack Token",
+        "hashed_secret": "a111111111111111111111111111111111111111",
+        "line_number": 7,
+        "is_verified": false
+      }
+    ],
+    "vendor/lib/deprecated.js": [
+      {
+        "type": "Base64 High Entropy String",
+        "hashed_secret": "b222222222222222222222222222222222222222",
+        "line_number": 42,
+        "is_verified": false
+      }
+    ],
+    "src/api.py": [
+      {
+        "type": "Hex High Entropy String",
+        "hashed_secret": "c333333333333333333333333333333333333333",
+        "line_number": 15,
+        "is_verified": true,
+        "is_secret": true
+      }
+    ],
+    "README.md": [
+      {
+        "type": "Secret Keyword",
+        "hashed_secret": "d444444444444444444444444444444444444444",
+        "line_number": 23,
+        "is_verified": false
+      }
+    ],
+    "src/keys.py": [
+      {
+        "type": "Private Key",
+        "hashed_secret": "e555555555555555555555555555555555555555",
+        "line_number": 1,
+        "is_verified": false
+      }
+    ],
+    "src/legacy.py": [
+      {
+        "type": "Secret Keyword",
+        "hashed_secret": "f666666666666666666666666666666666666666",
+        "line_number": 88,
+        "is_verified": false
+      }
+    ]
+  },
+  "generated_at": "2026-10-01T00:00:00Z"
+}
