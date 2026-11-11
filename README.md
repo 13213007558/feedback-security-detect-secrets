@@ -564,6 +564,16 @@ You can also use:
 API_KEY = 'WillAlsoBeIgnored'
 ```
 
+For Python files, the pragma is only honored when it appears in a real comment
+(determined by tokenizing the source, never executing it). A marker that merely
+appears inside a string literal will not allowlist anything:
+
+```python
+# This does NOT allowlist anything, since the marker is inside a string literal:
+API_KEY = 'this-will-still-be-detected'
+NOTE = "# pragma: allowlist secret"
+```
+
 This may be a convenient way for you to ignore secrets, without needing to regenerate the entire
 baseline again. If you need to explicitly search for these allowlisted secrets, you can also do:
 

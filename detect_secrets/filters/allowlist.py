@@ -1,5 +1,7 @@
+import io
 import os
 import re
+import tokenize
 from functools import lru_cache
 from typing import Dict
 from typing import Iterable
@@ -11,6 +13,9 @@ from ..util.code_snippet import CodeSnippet
 
 
 def is_line_allowlisted(filename: str, line: str, context: CodeSnippet) -> bool:
+    if _is_python_file(filename):
+        return _is_python_line_allowlisted(line, context)
+
     for payload, regexes in zip(
         [line, context.previous_line],
         _get_allowlist_regexes_for_file(filename),
@@ -20,6 +25,81 @@ def is_line_allowlisted(filename: str, line: str, context: CodeSnippet) -> bool:
                 return True
 
     return False
+
+
+def _is_python_file(filename: str) -> bool:
+    return os.path.splitext(filename)[1] in {'.py', '.pyi', '.pyw'}
+
+
+def _is_python_line_allowlisted(line: str, context: CodeSnippet) -> bool:
+    """
+    Unlike other file types (which rely on regexes), Python source is tokenized so
+    that only *real* comments can allowlist a line. This prevents a string literal
+    that merely contains the pragma text (e.g. inside a triple-quoted string) from
+    silencing a valid finding.
+    """
+    previous_line = context.previous_line
+    if 'pragma' not in line and 'pragma' not in previous_line:
+        return False
+
+    # NOTE: When scanning diffs, the snippet may not include any lines preceding
+    # the target line, so we can only work with the lexical context available.
+    preceding_lines = list(context.lines[:context.target_index])
+
+    # Inline pragma, on the same line as the secret.
+    if 'pragma' in line:
+        comments = _extract_python_comments(preceding_lines + [line])
+        comment = comments.get(len(preceding_lines) + 1)
+        if comment and get_allowlist_regexes(
+            comment_tuple=('#', ''),
+            nextline=False,
+        ).search(comment):
+            return True
+
+    # Standalone pragma, on the line before the secret.
+    if preceding_lines and 'pragma' in previous_line:
+        comments = _extract_python_comments(preceding_lines)
+        if (
+            # The marker must be a real comment...
+            len(preceding_lines) in comments
+            # ... and it must be the only thing on that line.
+            and get_allowlist_regexes(
+                comment_tuple=('#', ''),
+                nextline=True,
+            ).search(previous_line)
+        ):
+            return True
+
+    return False
+
+
+def _extract_python_comments(lines: List[str]) -> Dict[int, str]:
+    """
+    Tokenizes the given lines of Python source, and returns a mapping of
+    1-indexed line numbers (relative to `lines`) to the comment found on that
+    line, if any.
+
+    This fails closed: if the source cannot be tokenized (e.g. unterminated
+    string, whether from incomplete syntax or missing lexical context earlier
+    in the file), only comments confirmed before the error are returned. The
+    source is merely parsed, never executed.
+    """
+    source = ''.join(
+        line if line.endswith('\n') else line + '\n'
+        for line in lines
+    )
+
+    comments = {}
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(source).readline):
+            if token.type == tokenize.COMMENT:
+                comments[token.start[0]] = token.string
+    except (tokenize.TokenError, SyntaxError):
+        # Tokens yielded before the error are still trustworthy; anything
+        # afterwards cannot be confirmed to be a real comment.
+        pass
+
+    return comments
 
 
 @lru_cache(maxsize=1)
