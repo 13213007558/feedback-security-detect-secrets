@@ -5,6 +5,7 @@ from typing import cast
 from typing import Generator
 from typing import Iterable
 from typing import List
+from typing import Optional
 from typing import Set
 from typing import Tuple
 from typing import Union
@@ -137,7 +138,17 @@ def scan_line(line: str) -> Generator[PotentialSecret, None, None]:
     )
 
 
-def scan_file(filename: str) -> Generator[PotentialSecret, None, None]:
+def scan_file(
+    filename: str,
+    fileobj: Optional[NamedIO] = None,
+) -> Generator[PotentialSecret, None, None]:
+    """
+    :param fileobj: if provided, its contents are scanned instead of opening
+        ``filename`` from disk. ``filename`` is still used for all
+        filename-based filtering and in the reported results, which lets
+        callers scan content that does not match what is on disk (e.g. the
+        staged contents of a git index).
+    """
     try:
         if not get_plugins():   # pragma: no cover
             log.error('No plugins to scan with!')
@@ -151,7 +162,7 @@ def scan_file(filename: str) -> Generator[PotentialSecret, None, None]:
 
     try:
         has_secret = False
-        for lines in _get_lines_from_file(filename):
+        for lines in _get_lines_from_file(filename, fileobj):
             for secret in _process_line_based_plugins(
                 lines=list(enumerate(lines, start=1)),
                 filename=filename,
@@ -250,15 +261,27 @@ def _scan_for_allowlisted_secrets_in_lines(
             )
 
 
-def _get_lines_from_file(filename: str) -> Generator[List[str], None, None]:
+def _get_lines_from_file(
+    filename: str,
+    fileobj: Optional[NamedIO] = None,
+) -> Generator[List[str], None, None]:
     """
     This attempts to get lines in a given file. If no more lines are needed, the caller
     is responsible for breaking out of this loop.
 
+    When ``fileobj`` is supplied, it is scanned in place of opening ``filename`` -- the
+    two may hold different content, but the same ``filename`` is still passed to every
+    filter, so detection and allowlist decisions always see the same snapshot.
+
     :raises: IOError
     :raises: FileNotFoundError
     """
-    with open(filename) as f:
+    if fileobj is None:
+        f = open(filename)
+    else:
+        f = fileobj
+
+    with f:
         log.info(f'Checking file: {filename}')
 
         try:

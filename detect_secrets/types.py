@@ -1,3 +1,4 @@
+import io
 from io import TextIOBase
 from typing import Any
 from typing import NamedTuple
@@ -45,3 +46,16 @@ class SecretContext(NamedTuple):
 
 class NamedIO(TextIOBase):
     name: str
+
+
+class NamedStringIO(io.StringIO, NamedIO):
+    """
+    A text stream with an explicit ``name``. This lets us scan in-memory content (such as
+    a blob read from the git index) through the same file-oriented code paths as a real
+    on-disk file, while keeping the logical filename available to transformers and
+    filename-based filters.
+    """
+
+    def __init__(self, content: str, name: str) -> None:
+        super().__init__(content)
+        self.name = name

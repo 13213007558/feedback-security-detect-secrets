@@ -12,6 +12,7 @@ from typing import Tuple
 from . import scan
 from ..util.path import convert_local_os_path
 from .potential_secret import PotentialSecret
+from ..types import NamedIO
 from detect_secrets.settings import configure_settings_from_baseline
 from detect_secrets.settings import get_settings
 
@@ -72,9 +73,29 @@ class SecretsCollection:
                 for secret in secrets:
                     self[os.path.relpath(secret.filename, self.root)].add(secret)
 
-    def scan_file(self, filename: str) -> None:
-        for secret in scan.scan_file(os.path.join(self.root, convert_local_os_path(filename))):
-            self[convert_local_os_path(filename)].add(secret)
+    def scan_file(
+        self,
+        filename: str,
+        fileobj: Optional[NamedIO] = None,
+    ) -> None:
+        """
+        :param fileobj: when provided, scan this stream's contents instead of reading
+            ``filename`` from disk. The logical ``filename`` is still used for all
+            filtering, allowlist checks and result storage, so both decisions are made
+            against the same content snapshot.
+        """
+        logical_filename = convert_local_os_path(filename)
+
+        if fileobj is None:
+            secrets = scan.scan_file(os.path.join(self.root, logical_filename))
+        else:
+            secrets = scan.scan_file(
+                os.path.join(self.root, logical_filename),
+                fileobj=fileobj,
+            )
+
+        for secret in secrets:
+            self[logical_filename].add(secret)
 
     def scan_diff(self, diff: str) -> None:
         """
