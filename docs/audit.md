@@ -65,6 +65,39 @@ special types of secrets, and will treat all secrets equally. If you are looking
 systematic method of excluding "test" secrets, try
 [writing your own filter](filters.md#Writing-Your-Own-Filter).
 
+## Updating Baselines and Inheriting Audit Conclusions
+
+When a baseline is regenerated (`detect-secrets scan ... --baseline .secrets.baseline`), the
+fresh scan is merged with the previously audited baseline so that manual labelling work is
+not lost. Whether a finding keeps its old verdict depends on its *identity*: the tuple
+`(filename, hashed_secret, type)`. Line numbers are deliberately **not** part of the identity,
+since secrets are expected to move within their file.
+
+| Change between scans                              | Verdict inherited? | Reason                          |
+| ------------------------------------------------- | ------------------ | ------------------------------- |
+| Only the line number moved (same file)            | Yes                | Identity is unchanged           |
+| Same string repeated within one file              | Yes (one finding)  | Identical identity; deduplicated |
+| File renamed, content untouched                   | No -- re-audit     | Location is part of the verdict |
+| Same fake secret copied into another file         | No -- re-audit     | A verdict never spreads across files |
+| Same string flagged by a different detector       | No -- re-audit     | Detector type is part of identity |
+| String never seen before                          | No -- re-audit     | Genuinely new finding           |
+
+The guiding principle: a false-positive verdict describes **one finding in one location**, and
+must never be applied to every other location that happens to contain the same string. At the
+same time, inheritance only ever *adds* labels to the fresh scan -- new findings are never
+removed or suppressed to preserve a label; they simply stay unaudited and appear in the triage
+queue.
+
+Old baselines (e.g. v1.0.x format) remain readable: they are upgraded in-memory on load, so
+their audit conclusions can take part in the merge.
+
+For a hands-on demonstration of these rules (including a provenance report that only shows
+fingerprints and locations), run:
+
+```bash
+$ python scripts/demo_baseline_inheritance.py
+```
+
 ## Comparing Baselines
 
 ```bash

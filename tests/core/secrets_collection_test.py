@@ -3,6 +3,10 @@ from unittest import mock
 
 import pytest
 
+from detect_secrets.core.secrets_collection import INHERITED_EXACT_IDENTITY
+from detect_secrets.core.secrets_collection import REAUDIT_DETECTOR_CHANGED
+from detect_secrets.core.secrets_collection import REAUDIT_FILE_CHANGED
+from detect_secrets.core.secrets_collection import REAUDIT_NEW_FINDING
 from detect_secrets.core.secrets_collection import SecretsCollection
 from detect_secrets.settings import get_settings
 from detect_secrets.settings import transient_settings
@@ -210,6 +214,168 @@ def test_merge():
             assert secret.is_verified is False
 
         index += 1
+
+
+class TestMergeInheritance:
+    @staticmethod
+    def _merge(new_secrets, old_secrets):
+        inheritance_log = []
+        new_secrets.merge(old_secrets, inheritance_log=inheritance_log)
+        return {
+            (record.filename, record.secret_hash, record.secret_type): record
+            for record in inheritance_log
+        }
+
+    def test_line_number_move_keeps_audit_conclusion(self):
+        old_secret = potential_secret_factory(
+            type='type', filename='file', secret='value', line_number=1, is_secret=False,
+        )
+        new_secret = potential_secret_factory(
+            type='type', filename='file', secret='value', line_number=42,
+        )
+        old_secrets = SecretsCollection.load_from_baseline(
+            {'results': {'file': [old_secret.json()]}},
+        )
+        new_secrets = SecretsCollection.load_from_baseline(
+            {'results': {'file': [new_secret.json()]}},
+        )
+
+        log = self._merge(new_secrets, old_secrets)
+        merged = next(iter(new_secrets['file']))
+
+        assert merged.is_secret is False
+        record = log[('file', merged.secret_hash, 'type')]
+        assert record.reason == INHERITED_EXACT_IDENTITY
+        assert record.previous_location == ('file', 1)
+
+    def test_repeated_occurrence_in_same_file_is_same_finding(self):
+        # Sets dedupe identical (filename, hash, type) entries: a secret appearing
+        # twice in one file is one finding, and its verdict stays attached to it.
+        old_secret = potential_secret_factory(
+            type='type', filename='file', secret='value', line_number=1, is_secret=False,
+        )
+        moved_copy = potential_secret_factory(
+            type='type', filename='file', secret='value', line_number=8,
+        )
+        old_secrets = SecretsCollection.load_from_baseline(
+            {'results': {'file': [old_secret.json()]}},
+        )
+        new_secrets = SecretsCollection.load_from_baseline(
+            {'results': {'file': [moved_copy.json()]}},
+        )
+
+        log = self._merge(new_secrets, old_secrets)
+        assert len(new_secrets['file']) == 1
+        merged = next(iter(new_secrets['file']))
+        assert merged.is_secret is False
+        assert log[('file', merged.secret_hash, 'type')].reason == INHERITED_EXACT_IDENTITY
+
+    def test_renamed_file_requires_re_audit(self):
+        old_secret = potential_secret_factory(
+            type='type', filename='old_file', secret='value', line_number=1, is_secret=False,
+        )
+        new_secret = potential_secret_factory(
+            type='type', filename='renamed_file', secret='value', line_number=1,
+        )
+        old_secrets = SecretsCollection.load_from_baseline(
+            {'results': {'old_file': [old_secret.json()]}},
+        )
+        new_secrets = SecretsCollection.load_from_baseline(
+            {'results': {'renamed_file': [new_secret.json()]}},
+        )
+
+        log = self._merge(new_secrets, old_secrets)
+        merged = next(iter(new_secrets['renamed_file']))
+
+        assert merged.is_secret is None
+        record = log[('renamed_file', merged.secret_hash, 'type')]
+        assert record.reason == REAUDIT_FILE_CHANGED
+        assert record.previous_location is None
+
+    def test_copied_fake_secret_in_new_file_does_not_inherit_verdict(self):
+        # The false-positive label lives on one location; pasting the same fake
+        # secret into another file must not silently label the new copy.
+        old_secret = potential_secret_factory(
+            type='type', filename='original', secret='value', line_number=1, is_secret=False,
+        )
+        new_secrets = SecretsCollection.load_from_baseline({'results': {
+            'original': [potential_secret_factory(
+                type='type', filename='original', secret='value', line_number=1,
+            ).json()],
+            'copy': [potential_secret_factory(
+                type='type', filename='copy', secret='value', line_number=3,
+            ).json()],
+        }})
+        old_secrets = SecretsCollection.load_from_baseline(
+            {'results': {'original': [old_secret.json()]}},
+        )
+
+        log = self._merge(new_secrets, old_secrets)
+
+        original = next(iter(new_secrets['original']))
+        copied = next(iter(new_secrets['copy']))
+        assert original.is_secret is False
+        assert copied.is_secret is None
+        assert log[('copy', copied.secret_hash, 'type')].reason == REAUDIT_FILE_CHANGED
+        assert log[('original', original.secret_hash, 'type')].reason == INHERITED_EXACT_IDENTITY
+
+    def test_detector_type_change_requires_re_audit(self):
+        old_secret = potential_secret_factory(
+            type='old_type', filename='file', secret='value', line_number=1, is_secret=False,
+        )
+        new_secret = potential_secret_factory(
+            type='new_type', filename='file', secret='value', line_number=1,
+        )
+        old_secrets = SecretsCollection.load_from_baseline(
+            {'results': {'file': [old_secret.json()]}},
+        )
+        new_secrets = SecretsCollection.load_from_baseline(
+            {'results': {'file': [new_secret.json()]}},
+        )
+
+        log = self._merge(new_secrets, old_secrets)
+        merged = next(iter(new_secrets['file']))
+
+        assert merged.is_secret is None
+        assert log[('file', merged.secret_hash, 'new_type')].reason == REAUDIT_DETECTOR_CHANGED
+
+    def test_new_finding_is_kept_and_queued_for_audit(self):
+        new_secret = potential_secret_factory(
+            type='type', filename='file', secret='brand-new', line_number=2,
+        )
+        old_secrets = SecretsCollection.load_from_baseline({'results': {
+            'file': [potential_secret_factory(
+                type='type', filename='file', secret='value', line_number=1, is_secret=False,
+            ).json()],
+        }})
+        new_secrets = SecretsCollection.load_from_baseline(
+            {'results': {'file': [new_secret.json()]}},
+        )
+
+        log = self._merge(new_secrets, old_secrets)
+        merged = next(iter(new_secrets['file']))
+
+        # The new finding is neither dropped nor auto-labelled.
+        assert merged.secret_hash == new_secret.secret_hash
+        assert merged.is_secret is None
+        assert log[('file', merged.secret_hash, 'type')].reason == REAUDIT_NEW_FINDING
+
+    def test_existing_newer_label_is_not_overwritten(self):
+        old_secret = potential_secret_factory(
+            type='type', filename='file', secret='value', line_number=1, is_secret=False,
+        )
+        new_secret = potential_secret_factory(
+            type='type', filename='file', secret='value', line_number=2, is_secret=True,
+        )
+        old_secrets = SecretsCollection.load_from_baseline(
+            {'results': {'file': [old_secret.json()]}},
+        )
+        new_secrets = SecretsCollection.load_from_baseline(
+            {'results': {'file': [new_secret.json()]}},
+        )
+
+        self._merge(new_secrets, old_secrets)
+        assert next(iter(new_secrets['file'])).is_secret is True
 
 
 class TestTrim:

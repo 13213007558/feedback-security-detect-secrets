@@ -5,6 +5,7 @@ from typing import Any
 from typing import Dict
 from typing import Generator
 from typing import List
+from typing import NamedTuple
 from typing import Optional
 from typing import Set
 from typing import Tuple
@@ -14,6 +15,31 @@ from ..util.path import convert_local_os_path
 from .potential_secret import PotentialSecret
 from detect_secrets.settings import configure_settings_from_baseline
 from detect_secrets.settings import get_settings
+
+
+# Inheritance outcomes, explaining why a finding in the new scan keeps (or loses)
+# the audit conclusion recorded for it in the old baseline.
+INHERITED_EXACT_IDENTITY = 'inherited:exact-identity'
+REAUDIT_DETECTOR_CHANGED = 're-audit:detector-type-changed'
+REAUDIT_FILE_CHANGED = 're-audit:filename-changed'
+REAUDIT_NEW_FINDING = 're-audit:new-finding'
+
+
+class InheritanceRecord(NamedTuple):
+    """
+    Describes what happened to a single finding in the new scan while inheriting
+    audit conclusions from the old baseline.
+
+    Only fingerprints (``secret_hash``) and locations are recorded; the candidate
+    secret value itself is intentionally never part of this record.
+    """
+    reason: str
+    filename: str
+    line_number: int
+    secret_hash: str
+    secret_type: str
+    is_secret: Optional[bool]
+    previous_location: Optional[Tuple[str, int]] = None
 
 
 class PatchedFile:
@@ -89,7 +115,11 @@ class SecretsCollection:
                 'installing that package, and try again.',
             )
 
-    def merge(self, old_results: 'SecretsCollection') -> None:
+    def merge(
+        self,
+        old_results: 'SecretsCollection',
+        inheritance_log: Optional[List[InheritanceRecord]] = None,
+    ) -> None:
         """
         We operate under an assumption that the latest results are always more accurate,
         assuming that the baseline is created on the same repository. However, we cannot
@@ -98,28 +128,58 @@ class SecretsCollection:
 
         Therefore, this function serves to extract this information from the old results,
         and amend the new results with it.
+
+        A finding's identity is the tuple ``(filename, hashed_secret, type)``: line numbers
+        are deliberately excluded, since a secret is expected to move within its file. The
+        only identity change for which an audit conclusion is automatically kept is a line
+        number shift inside the same file. Any other change (file rename, a copy of the same
+        fake secret into another file, or a different detector type) describes a *different*
+        finding, and must be audited again -- a false-positive verdict for one location must
+        never be applied to every other location that happens to contain the same string.
+
+        New findings are never removed or suppressed to preserve a label: they simply stay
+        unaudited and show up in the triage queue.
+
+        :param inheritance_log: if supplied, one :class:`InheritanceRecord` per new finding
+            is appended to it, making the provenance (or re-audit reason) of every label
+            explicit. Candidate secret values are never written to this log.
         """
-        for filename in old_results.files:
-            if filename not in self.files:
-                continue
+        old_index = _build_old_secret_index(old_results)
 
-            # This allows us to obtain the same secret, by accessing the hash.
-            mapping = {
-                secret: secret
-                for secret in self.data[filename]
-            }
+        for filename in sorted(self.files):
+            for new_secret in sorted(
+                self.data[filename],
+                key=lambda secret: (secret.line_number, secret.secret_hash, secret.type),
+            ):
+                # NOTE: we deliberately match on the collection's filename key (the one
+                # serialized into the baseline), not on `new_secret.filename`, which may
+                # still hold the path that was used to locate the file on disk.
+                reason, old_secret = _classify_inheritance(filename, new_secret, old_index)
+                if reason == INHERITED_EXACT_IDENTITY and old_secret is not None:
+                    # Only override if there's no newer value.
+                    if new_secret.is_secret is None:
+                        new_secret.is_secret = old_secret.is_secret
 
-            for old_secret in old_results.data[filename]:
-                if old_secret not in mapping:
-                    continue
+                    # If the old value is false, it won't make a difference.
+                    if not new_secret.is_verified:
+                        new_secret.is_verified = old_secret.is_verified
 
-                # Only override if there's no newer value.
-                if mapping[old_secret].is_secret is None:
-                    mapping[old_secret].is_secret = old_secret.is_secret
-
-                # If the old value is false, it won't make a difference.
-                if not mapping[old_secret].is_verified:
-                    mapping[old_secret].is_verified = old_secret.is_verified
+                if inheritance_log is not None:
+                    inheritance_log.append(
+                        InheritanceRecord(
+                            reason=reason,
+                            filename=filename,
+                            line_number=new_secret.line_number,
+                            secret_hash=new_secret.secret_hash,
+                            secret_type=new_secret.type,
+                            is_secret=new_secret.is_secret,
+                            previous_location=(
+                                (filename, old_secret.line_number)
+                                if reason == INHERITED_EXACT_IDENTITY and old_secret
+                                else None
+                            ),
+                        ),
+                    )
 
     def trim(
         self,
@@ -311,6 +371,62 @@ class SecretsCollection:
     def __len__(self) -> int:
         """Returns the total number of secrets in the collection."""
         return sum(len(secrets) for secrets in self.data.values())
+
+
+def _build_old_secret_index(
+    old_results: 'SecretsCollection',
+) -> Dict[Tuple[str, str], List[PotentialSecret]]:
+    """
+    Groups audited findings by ``(filename, hashed_secret)``. This lets us tell apart the
+    three ways a new finding can relate to an old one sharing its fingerprint:
+    same detector, different detector, or merely a same-valued string in another file.
+    """
+    index: Dict[Tuple[str, str], List[PotentialSecret]] = defaultdict(list)
+    for filename in old_results.files:
+        for old_secret in old_results.data[filename]:
+            index[(filename, old_secret.secret_hash)].append(old_secret)
+
+    return index
+
+
+def _classify_inheritance(
+    filename: str,
+    new_secret: PotentialSecret,
+    old_index: Dict[Tuple[str, str], List[PotentialSecret]],
+) -> Tuple[str, Optional[PotentialSecret]]:
+    """
+    Decides whether the audit conclusion recorded for ``new_secret`` may be inherited.
+
+    The match keys are intentionally strict, so that a verdict for one location never
+    spreads to other locations:
+
+    * ``(filename, hashed_secret, type)`` identical  -> keep the conclusion. A changed
+      line number does not affect the identity, which covers line-only moves and
+      repeated occurrences of the same finding within one file.
+    * same file and fingerprint, different type      -> the detector changed; re-audit.
+    * same fingerprint, different file               -> rename or a copy of the same
+      fake secret elsewhere; re-audit.
+    * no matching fingerprint at all                 -> genuinely new finding; re-audit.
+
+    :param filename: the collection's key for this finding (as serialized in baselines),
+        which is not necessarily identical to ``new_secret.filename``.
+    """
+    same_file_matches = old_index.get((filename, new_secret.secret_hash), [])
+    for old_secret in same_file_matches:
+        if old_secret.type == new_secret.type:
+            return INHERITED_EXACT_IDENTITY, old_secret
+
+    if same_file_matches:
+        # The string is still in the same file, but a different detector now flags it.
+        return REAUDIT_DETECTOR_CHANGED, None
+
+    for (old_filename, old_hash), old_secrets in old_index.items():
+        if old_hash == new_secret.secret_hash and old_filename != filename:
+            # Same string, different file: a rename or a copy of the fake secret.
+            # The old verdict belongs to the old location only.
+            return REAUDIT_FILE_CHANGED, None
+
+    return REAUDIT_NEW_FINDING, None
 
 
 def _scan_file_and_serialize(filename: str) -> List[PotentialSecret]:
